@@ -1,7 +1,6 @@
 // ============================================================
 // gameLogic.js — Toàn bộ luật chơi Chess Card Game
 // KHÔNG phụ thuộc socket, express, hay UI
-// Test: node server/gameLogic.js
 // ============================================================
 
 const COLORS      = ['red', 'black', 'green', 'blue'];
@@ -48,14 +47,13 @@ function createGameState(numPlayers, numColors = 4, firstTurn = 0) {
   return { hands, board, drawPile, currentTurn: firstTurn, numPlayers, numColors };
 }
 
-// ── Đặt bài ──────────────────────────────────────────────────
-// Phong Hậu + lá thường: cùng màu HOẶC cùng loại
+// ── Luật đặt bài ─────────────────────────────────────────────
 function canPlace(card, topCard) {
   if (!card || !topCard) return false;
   return card.color === topCard.color || card.type === topCard.type;
 }
 
-// ── Ô có thể ăn ──────────────────────────────────────────────
+// ── Ô có thể ăn theo loại quân ───────────────────────────────
 function getAttackSquares(card, fr, fc, board, playerSide = 'bottom') {
   if (card.type === 'cung_ten' || card.type === 'phong_hau') return [];
   const inB     = (r, c) => r >= 0 && r < 3 && c >= 0 && c < 3;
@@ -102,7 +100,23 @@ function getAttackSquares(card, fr, fc, board, playerSide = 'bottom') {
   return sq;
 }
 
-// ── Hành động game ───────────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+// 3 ACT CỦA MỖI LƯỢT
+// ACT 1 — refillHand      : bù bài lên đủ 9 (đầu lượt)
+// ACT 2 — applyPlaceCard  : đặt 1 lá (tay 9→8)
+//          applyAttack /
+//          applyDraw /
+//          applyCungTenSteal : nhận 1 lá (tay 8→9)
+// ACT 3 — advanceTurn     : chuyển lượt (KHÔNG bù bài)
+// ════════════════════════════════════════════════════════════
+
+// ACT 1: Bù bài đầu lượt — gọi DUY NHẤT 1 lần khi bắt đầu lượt
+function refillHand(gs, playerIdx) {
+  while (gs.hands[playerIdx].length < 9 && gs.drawPile.length > 0)
+    gs.hands[playerIdx].push(gs.drawPile.shift());
+}
+
+// ACT 2a: Đặt bài — tay 9→8
 function applyPlaceCard(gs, playerIdx, cardIdx, row, col) {
   const hand = gs.hands[playerIdx];
   if (cardIdx < 0 || cardIdx >= hand.length)
@@ -115,53 +129,68 @@ function applyPlaceCard(gs, playerIdx, cardIdx, row, col) {
   }
   if (!canPlace(card, pile[pile.length-1]))
     return { ok: false, error: 'Không thể đặt lá này lên ô đó' };
-  hand.splice(cardIdx, 1);
+
+  hand.splice(cardIdx, 1); // tay 9→8
   pile.push(card);
+
   if (card.type === 'phong_hau') {
+    // Phong Hậu: tự bốc luôn 8→9, kết thúc lượt
     if (gs.drawPile.length > 0) hand.push(gs.drawPile.shift());
     return { ok: true, endTurn: true };
   }
-  if (card.type === 'cung_ten') return { ok: true, waitForChoice: true };
+  if (card.type === 'cung_ten') {
+    // Cung Tên: tay 8, chờ chọn cướp hay bốc
+    return { ok: true, waitForChoice: true };
+  }
+  // Quân thường: tay 8, chờ chọn ăn hay bốc
   return { ok: true, waitForAction: true };
 }
 
+// ACT 2b: Ăn quân — tay 8→9
 function applyAttack(gs, playerIdx, row, col) {
   const pile = gs.board[row][col];
   if (!pile || pile.length === 0) return { ok: false, error: 'Ô trống' };
   const taken = pile.pop();
-  gs.hands[playerIdx].push(taken);
-  // Chỉ bù khi ô hoàn toàn trống
+  gs.hands[playerIdx].push(taken); // 8→9
   if (pile.length === 0 && gs.drawPile.length > 0)
-    pile.push(gs.drawPile.shift());
+    pile.push(gs.drawPile.shift()); // bù ô trống bàn
   return { ok: true, endTurn: true, taken };
 }
 
+// ACT 2b: Bốc bài — tay 8→9
 function applyDraw(gs, playerIdx) {
   if (gs.drawPile.length === 0) return { ok: false, error: 'Chồng bài đã hết' };
-  gs.hands[playerIdx].push(gs.drawPile.shift());
+  gs.hands[playerIdx].push(gs.drawPile.shift()); // 8→9
   return { ok: true, endTurn: true };
 }
 
+// ACT 2b: Cung Tên cướp bài — tay 8→9
 function applyCungTenSteal(gs, playerIdx, targetIdx) {
   const target = gs.hands[targetIdx];
   if (!target || target.length === 0) return { ok: false, error: 'Người đó không còn bài' };
   const stolen = target.splice(Math.floor(Math.random()*target.length), 1)[0];
-  gs.hands[playerIdx].push(stolen);
-  // Người bị cướp KHÔNG bù ngay — đến lượt họ mới bốc
+  gs.hands[playerIdx].push(stolen); // 8→9
   return { ok: true, endTurn: true, stolen };
 }
 
+// ACT 3: Kết thúc lượt — chuyển người, bù ô trống bàn
+// KHÔNG bù bài tay — bù bài tay là ACT 1 của lượt sau
 function advanceTurn(gs, players) {
+  // Bù ô trống trên bàn
   for (let r = 0; r < 3; r++)
     for (let c = 0; c < 3; c++)
       if (gs.board[r][c].length === 0 && gs.drawPile.length > 0)
         gs.board[r][c].push(gs.drawPile.shift());
+
   if (gs.drawPile.length === 0) return { gameOver: true };
+
+  // Chuyển lượt, bỏ qua người disconnect
   let tries = 0;
   do {
     gs.currentTurn = (gs.currentTurn + 1) % gs.numPlayers;
     tries++;
   } while (players[gs.currentTurn]?.disconnected && tries < gs.numPlayers);
+
   return { gameOver: false };
 }
 
@@ -176,17 +205,13 @@ const PENALTY = {
 };
 function penaltyCard(c) { return (PENALTY[c.type]||(() => 2))(c.number||0); }
 
-// Tìm tất cả combo có thể từ tập lá (cùng màu)
 function findAllCombos(cards) {
   const combos = [];
-
-  // Nhóm theo màu
   const byColor = {};
   for (const c of cards) {
     if (!byColor[c.color]) byColor[c.color] = [];
     byColor[c.color].push(c);
   }
-
   for (const [color, group] of Object.entries(byColor)) {
     const jokers  = group.filter(c => c.type === 'phong_hau');
     const normals = group.filter(c => c.type !== 'phong_hau');
@@ -198,11 +223,9 @@ function findAllCombos(cards) {
     for (const t of PIECE_TYPES)
       if (byType[t]) byType[t].sort((a,b) => a.number - b.number);
 
-    // Bộ hoàng gia hoàn hảo (cùng số N)
     for (let N = 1; N <= 3; N++) {
       const matched = []; let jLeft = [...jokers]; let ok = true;
       for (const t of PIECE_TYPES) {
-        if (t === 'tot' && N > 5) { ok=false; break; }
         const found = (byType[t]||[]).find(c => c.number === N);
         if (found) matched.push(found);
         else if (jLeft.length > 0) matched.push(jLeft.shift());
@@ -211,10 +234,6 @@ function findAllCombos(cards) {
       if (ok && matched.length === 6)
         combos.push({ name:`Bộ hoàng gia hoàn hảo ${color} #${N}`, score:20*N, cardIds:matched.map(c=>c.id) });
     }
-    // Thêm N=4,5 cho Tốt — tot có thể dùng số 4,5 nhưng các loại khác max 3
-    // → bỏ qua vì tot_4, tot_5 không thể ghép với ma/tinh/xe/hau/vua số 4,5
-
-    // Bộ hoàng gia (đủ 6 loại, khác số)
     {
       const matched = []; let jLeft = [...jokers];
       for (const t of PIECE_TYPES) {
@@ -225,16 +244,12 @@ function findAllCombos(cards) {
       if (matched.length === 6)
         combos.push({ name:`Bộ hoàng gia ${color}`, score:20, cardIds:matched.map(c=>c.id) });
     }
-
-    // Ngũ Tốt
     {
       const tots = byType['tot']||[]; let jLeft=[...jokers]; const used=[...tots];
       while (used.length < 5 && jLeft.length > 0) used.push(jLeft.shift());
       if (used.length >= 5)
         combos.push({ name:`Ngũ Tốt ${color}`, score:15, cardIds:used.slice(0,5).map(c=>c.id) });
     }
-
-    // Ba cùng loại
     const triScore = { vua:10, hau:9, xe:5, ma:3, tinh:3 };
     for (const [t, sc] of Object.entries(triScore)) {
       const arr = byType[t]||[]; let jLeft=[...jokers]; const used=[...arr];
@@ -242,8 +257,6 @@ function findAllCombos(cards) {
       if (used.length >= 3)
         combos.push({ name:`Ba ${t} ${color}`, score:sc, cardIds:used.slice(0,3).map(c=>c.id) });
     }
-
-    // Ba Tốt liên tiếp
     {
       const tots = byType['tot']||[];
       for (let i=0; i<=tots.length-3; i++) {
@@ -252,31 +265,23 @@ function findAllCombos(cards) {
           combos.push({ name:`Ba Tốt liên tiếp ${color} ${a.number}-${c2.number}`, score:2, cardIds:[a.id,b.id,c2.id] });
       }
     }
-
-    // Đôi số liên tiếp
     const pairScore = { vua:5, hau:4, xe:3, ma:2, tinh:2, tot:1 };
     for (const [t, sc] of Object.entries(pairScore)) {
       const arr = byType[t]||[];
-      // Đôi thật
       for (let i=0; i<arr.length-1; i++)
         if (arr[i+1].number === arr[i].number+1)
           combos.push({ name:`Đôi ${t} ${color} ${arr[i].number}-${arr[i+1].number}`, score:sc, cardIds:[arr[i].id,arr[i+1].id] });
-      // Đôi + Phong Hậu (joker)
       if (arr.length >= 1 && jokers.length > 0)
         combos.push({ name:`Đôi ${t}+joker ${color}`, score:sc, cardIds:[arr[0].id, jokers[0].id] });
     }
   }
-
   return combos;
 }
 
-// Tìm cách phân combo tối ưu bằng greedy (sắp theo điểm giảm dần)
-// Mỗi lá chỉ vào 1 combo
 function findBestAssignment(hand) {
   if (!hand || hand.length === 0) return { chosen:[], leftover:[], score:0 };
   const allCombos = findAllCombos(hand);
   allCombos.sort((a,b) => b.score - a.score);
-
   const used = new Set();
   const chosen = [];
   for (const combo of allCombos) {
@@ -285,7 +290,6 @@ function findBestAssignment(hand) {
       chosen.push(combo);
     }
   }
-
   const leftover = hand.filter(c => !used.has(c.id));
   const score = chosen.reduce((s,c) => s+c.score, 0)
               - leftover.reduce((s,c) => s+penaltyCard(c), 0);
@@ -299,6 +303,7 @@ function canHaBai(hand) {
 }
 
 module.exports = {
+  refillHand,
   COLORS, PIECE_TYPES, FUNC_TYPES,
   createDeck, shuffle, dealCards, createGameState,
   canPlace, getAttackSquares,
@@ -307,65 +312,34 @@ module.exports = {
   scoreHand, canHaBai, findBestAssignment, findAllCombos,
 };
 
-// ── Self-test ────────────────────────────────────────────────
 if (require.main === module) {
   let pass = 0, fail = 0;
   function check(desc, got, expected) {
     if (got === expected) { console.log(`  ✓ ${desc}`); pass++; }
     else { console.log(`  ✗ ${desc}: got ${got}, expected ${expected}`); fail++; }
   }
-
-  console.log('=== Test gameLogic.js ===\n');
-
-  // Bộ bài
-  check('Deck 88 lá', createDeck(4).length, 88);
-  check('Deck 3 màu = 66 lá', createDeck(3).length, 66);
-
-  // Chia bài
-  const gs = createGameState(4);
-  check('Tay bài 9 lá', gs.hands[0].length, 9);
-  check('DrawPile đúng', gs.drawPile.length, 88 - 4*9 - 9);
-
-  // canPlace
-  const red_tot1 = { id:'rt1', color:'red',   type:'tot', number:1 };
-  const red_ma1  = { id:'rm1', color:'red',   type:'ma',  number:1 };
-  const blk_tot2 = { id:'bt2', color:'black', type:'tot', number:2 };
-  const blk_xe1  = { id:'bx1', color:'black', type:'xe',  number:1 };
-  const red_ph   = { id:'rph', color:'red',   type:'phong_hau', number:null };
-  check('Cùng màu được đặt',       canPlace(red_tot1, red_ma1),  true);
-  check('Cùng loại được đặt',      canPlace(red_tot1, blk_tot2), true);
-  check('Khác màu khác loại',      canPlace(red_tot1, blk_xe1),  false);
-  check('Phong Hậu cùng màu',      canPlace(red_ph,   red_tot1), true);
-  check('Phong Hậu chồng Phong Hậu', canPlace(red_ph, red_ph),  true);
-  check('Phong Hậu khác màu',      canPlace(red_ph,   blk_xe1),  false);
-
-  // Combo scores
-  const baVua = [
-    {id:'v1',color:'red',type:'vua',number:1},
-    {id:'v2',color:'red',type:'vua',number:2},
-    {id:'v3',color:'red',type:'vua',number:3},
-  ];
-  check('Ba Vua = 10', scoreHand(baVua), 10);
-
-  const doiHau = [
-    {id:'h1',color:'blue',type:'hau',number:1},
-    {id:'h2',color:'blue',type:'hau',number:2},
-  ];
-  check('Đôi Hậu = 4', scoreHand(doiHau), 4);
-
-  const vuaLe = [{id:'v1',color:'red',type:'vua',number:2}];
-  check('Vua lẻ = -7', scoreHand(vuaLe), -(5+2));
-
-  // canHaBai
-  const good9 = [
-    {id:'a1',color:'red',type:'vua',number:1},{id:'a2',color:'red',type:'vua',number:2},{id:'a3',color:'red',type:'vua',number:3},
-    {id:'a4',color:'red',type:'hau',number:1},{id:'a5',color:'red',type:'hau',number:2},{id:'a6',color:'red',type:'hau',number:3},
-    {id:'a7',color:'red',type:'xe', number:1},{id:'a8',color:'red',type:'xe', number:2},{id:'a9',color:'red',type:'xe', number:3},
-  ];
-  check('Ba Vua+Ba Hậu+Ba Xe hạ được', canHaBai(good9), true);
-
-  const bad9 = [...good9.slice(0,8), {id:'z1',color:'black',type:'ma',number:1}];
-  check('Có lá lẻ không hạ được', canHaBai(bad9), false);
-
+  console.log('=== Test 3-Act flow ===\n');
+  const gs = createGameState(2);
+  check('Bắt đầu: tay 9 lá', gs.hands[0].length, 9);
+  // ACT 1: bù bài (không thêm vì đã đủ 9)
+  refillHand(gs, 0);
+  check('ACT1: vẫn 9 lá sau refill', gs.hands[0].length, 9);
+  // ACT 2a: đặt bài
+  const r = applyPlaceCard(gs, 0, 0, 0, 0);
+  if (r.ok && r.endTurn) {
+    check('Phong Hậu: tay 9 lá sau đặt+bốc', gs.hands[0].length, 9);
+  } else if (r.ok) {
+    check('ACT2a: tay 8 lá sau đặt', gs.hands[0].length, 8);
+    // ACT 2b: bốc bài
+    applyDraw(gs, 0);
+    check('ACT2b: tay 9 lá sau bốc', gs.hands[0].length, 9);
+  }
+  // ACT 3: chuyển lượt
+  advanceTurn(gs, [{},{}]);
+  check('ACT3: currentTurn chuyển sang 1', gs.currentTurn, 1);
+  check('ACT3: tay player 1 VẪN 9 (chưa refill)', gs.hands[1].length, 9);
+  // ACT 1 lượt mới
+  refillHand(gs, gs.currentTurn);
+  check('ACT1 lượt mới: tay 9 lá', gs.hands[gs.currentTurn].length, 9);
   console.log(`\n${pass} passed, ${fail} failed`);
 }

@@ -1,16 +1,18 @@
 // ============================================================
 // socketHandler.js — Xử lý toàn bộ sự kiện Socket.io
+// 3-Act flow:
+//   ACT1: refillHand đầu lượt (chỉ khi bắt đầu lượt mới)
+//   ACT2: place_card → attack/draw/steal (tay 9→8→9)
+//   ACT3: advanceTurn (chỉ chuyển lượt, KHÔNG bù bài)
 // ============================================================
 
 const {
-  createGameState, advanceTurn,
+  createGameState, advanceTurn, refillHand,
   applyPlaceCard, applyAttack, applyDraw, applyCungTenSteal,
-  scoreHand, getAttackSquares,
+  scoreHand, canHaBai, getAttackSquares,
 } = require('./gameLogic');
 
 const rooms = {};
-
-console.log('[socketHandler] VERSION 2 - pendingAction loaded OK');
 
 function genRoomId() {
   return Math.random().toString(36).substr(2, 6).toUpperCase();
@@ -25,9 +27,6 @@ function getPlayerIdx(room, socketId) {
   return room.players.findIndex(p => p.socketId === socketId);
 }
 
-// ── buildView: mỗi người nhận đúng thông tin của mình ────────
-// pendingAction: nếu server đang chờ player hiện tại chọn ăn/bốc/cướp
-// thì gửi kèm thông tin để client biết cần làm gì
 function buildView(room, myIdx) {
   const gs = room.gameState;
   return {
@@ -48,11 +47,11 @@ function buildView(room, myIdx) {
     myHand:        gs ? gs.hands[myIdx] : [],
     lastAction:    room.lastAction    ?? null,
     result:        room.result        ?? null,
-    // pendingAction chỉ gửi cho đúng người cần thực hiện
     pendingAction: (room.pendingAction?.playerIdx === myIdx) ? room.pendingAction : null,
   };
 }
 
+// broadcastRoom: chỉ gửi state, KHÔNG bù bài
 function broadcastRoom(io, room) {
   room.players.forEach((p, idx) => {
     const sock = io.sockets.sockets.get(p.socketId);
@@ -79,6 +78,7 @@ function endGame(io, room, winnerIdx) {
   broadcastRoom(io, room);
 }
 
+// ACT3: kết thúc lượt — chuyển người, KHÔNG bù bài
 function finishTurn(io, room) {
   room.pendingAction = null;
   const { gameOver } = advanceTurn(room.gameState, room.players);
@@ -96,7 +96,6 @@ function finishTurn(io, room) {
   }
 }
 
-// ── Đăng ký handlers ─────────────────────────────────────────
 function registerHandlers(io, socket) {
 
   socket.on('room:create', ({ name }, cb) => {
@@ -179,20 +178,20 @@ function registerHandlers(io, socket) {
 
     const gs = room.gameState;
 
-    // ── Nếu đang có pendingAction, chỉ chấp nhận action đúng loại ──
+    // ── Đang có pendingAction: ACT2b (ăn/bốc/cướp) ──────────
+    // Tay đang 8 lá, chờ nhận thêm 1 → 9
     if (room.pendingAction) {
       const pa = room.pendingAction;
       if (pa.playerIdx !== playerIdx)
         return cb?.({ ok: false, error: 'Chưa đến lượt bạn' });
 
       if (pa.type === 'choose_action') {
-        // Player cần chọn: attack hoặc draw
         if (action.type === 'attack') {
           const result = applyAttack(gs, playerIdx, action.row, action.col);
           if (!result.ok) return cb?.({ ok: false, error: result.error });
           room.lastAction = { type: 'attack', player: playerIdx, taken: result.taken, row: action.row, col: action.col };
           cb?.({ ok: true });
-          finishTurn(io, room);
+          finishTurn(io, room); // ACT3
           return;
         }
         if (action.type === 'draw') {
@@ -200,20 +199,19 @@ function registerHandlers(io, socket) {
           if (!result.ok) return cb?.({ ok: false, error: result.error });
           room.lastAction = { type: 'draw', player: playerIdx };
           cb?.({ ok: true });
-          finishTurn(io, room);
+          finishTurn(io, room); // ACT3
           return;
         }
         return cb?.({ ok: false, error: 'Hãy chọn ăn quân hoặc bốc bài' });
       }
 
       if (pa.type === 'choose_steal') {
-        // Player cần chọn: steal hoặc draw (Cung Tên)
         if (action.type === 'cungten_steal') {
           const result = applyCungTenSteal(gs, playerIdx, action.targetIdx);
           if (!result.ok) return cb?.({ ok: false, error: result.error });
           room.lastAction = { type: 'cungten_steal', player: playerIdx, target: action.targetIdx, stolen: result.stolen };
           cb?.({ ok: true });
-          finishTurn(io, room);
+          finishTurn(io, room); // ACT3
           return;
         }
         if (action.type === 'cungten_draw') {
@@ -221,18 +219,24 @@ function registerHandlers(io, socket) {
           if (!result.ok) return cb?.({ ok: false, error: result.error });
           room.lastAction = { type: 'draw', player: playerIdx };
           cb?.({ ok: true });
-          finishTurn(io, room);
+          finishTurn(io, room); // ACT3
           return;
         }
         return cb?.({ ok: false, error: 'Hãy chọn cướp bài hoặc bốc bài' });
       }
     }
 
-    // ── Không có pendingAction: phải đúng lượt và chỉ được place_card / ha_bai ──
+    // ── Không có pendingAction: bắt đầu lượt mới ────────────
     if (playerIdx !== gs.currentTurn)
       return cb?.({ ok: false, error: 'Chưa đến lượt bạn' });
 
+    // ACT1: bù bài lên đủ 9 trước khi làm bất cứ điều gì
+    refillHand(gs, playerIdx);
+
+    // Hạ bài nếu đủ điều kiện
     if (action.type === 'ha_bai') {
+      if (!canHaBai(gs.hands[playerIdx]))
+        return cb?.({ ok: false, error: 'Chưa đủ điều kiện hạ bài' });
       room.lastAction = { type: 'ha_bai', player: playerIdx };
       cb?.({ ok: true });
       endGame(io, room, playerIdx);
@@ -242,7 +246,7 @@ function registerHandlers(io, socket) {
     if (action.type !== 'place_card')
       return cb?.({ ok: false, error: 'Hành động không hợp lệ' });
 
-    console.log('[place_card] player', playerIdx, 'card', action.cardIdx, 'at', action.row, action.col);
+    // ACT2a: đặt bài (tay 9→8)
     const result = applyPlaceCard(gs, playerIdx, action.cardIdx, action.row, action.col);
     if (!result.ok) return cb?.({ ok: false, error: result.error });
 
@@ -250,14 +254,14 @@ function registerHandlers(io, socket) {
     room.lastAction = { type: 'place_card', player: playerIdx, card: placedCard, row: action.row, col: action.col };
 
     if (result.endTurn) {
-      // Phong Hậu: đã tự bốc, kết thúc lượt luôn
+      // Phong Hậu: đã tự bốc (8→9), kết thúc lượt
       cb?.({ ok: true });
-      finishTurn(io, room);
+      finishTurn(io, room); // ACT3
       return;
     }
 
     if (result.waitForChoice) {
-      // Cung Tên: cần chọn cướp hay bốc
+      // Cung Tên: tay 8, chờ chọn cướp hay bốc
       room.pendingAction = { type: 'choose_steal', playerIdx, row: action.row, col: action.col, card: placedCard };
       cb?.({ ok: true });
       broadcastRoom(io, room);
@@ -265,17 +269,17 @@ function registerHandlers(io, socket) {
     }
 
     if (result.waitForAction) {
-      // Quân thường: tính ô có thể ăn
-      const attackSquares = getAttackSquares(placedCard, action.row, action.col, gs.board);
-      console.log('[place_card] attackSquares:', attackSquares.length, 'card:', placedCard.type);
+      // Quân thường: tay 8, tính ô có thể ăn
+      const playerSide = ['bottom', 'left', 'top', 'right'][playerIdx % 4];
+      const attackSquares = getAttackSquares(placedCard, action.row, action.col, gs.board, playerSide);
       if (attackSquares.length === 0) {
-        // Không có ô nào ăn được → tự bốc luôn
+        // Không ăn được → tự bốc (8→9), kết thúc lượt
         const drawResult = applyDraw(gs, playerIdx);
         if (drawResult.ok) room.lastAction = { type: 'draw', player: playerIdx };
         cb?.({ ok: true });
-        finishTurn(io, room);
+        finishTurn(io, room); // ACT3
       } else {
-        // Có ô để ăn → chờ player chọn
+        // Có thể ăn → chờ player chọn ăn hay bốc
         room.pendingAction = {
           type: 'choose_action',
           playerIdx,
@@ -307,7 +311,7 @@ function registerHandlers(io, socket) {
       const gs = room.gameState;
       const disconnIdx = getPlayerIdx(room, socket.id);
 
-      // Nếu người disconnect đang có pendingAction → bốc tự động rồi advance
+      // Người disconnect đang ở giữa lượt (pendingAction) → bốc tự động
       if (room.pendingAction?.playerIdx === disconnIdx) {
         applyDraw(gs, disconnIdx);
         room.pendingAction = null;

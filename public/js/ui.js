@@ -3,6 +3,18 @@
 // ============================================================
 import { S, canPlace, getAttackSquares, getPlayerSide, findBestAssignment, canHaBai } from './game.js';
 
+// ── Inject drag & drop CSS ────────────────────────────────────
+(function injectDragCSS() {
+  const style = document.createElement('style');
+  style.textContent = `
+    #my-hand .card { cursor: grab; transition: transform 0.15s, opacity 0.15s; user-select: none; }
+    #my-hand .card img { pointer-events: none; draggable: false; }
+    #my-hand .card.dragging { opacity: 0.4; transform: scale(0.95); cursor: grabbing; }
+    #my-hand .card.drag-over { transform: translateY(-8px) scale(1.05); outline: 2px solid #facc15; }
+  `;
+  document.head.appendChild(style);
+})();
+
 // ── Hằng hiển thị ────────────────────────────────────────────
 export const LABELS = { tot:'Tốt', ma:'Mã', tinh:'Tịnh', xe:'Xe', hau:'Hậu', vua:'Vua', cung_ten:'Cung Tên', phong_hau:'Phong Hậu' };
 export const COLOR_VI = { red:'Đỏ', black:'Đen', green:'Xanh', blue:'Vàng' };
@@ -35,6 +47,7 @@ export function makeCardEl(card, opts = {}) {
   const img = document.createElement('img');
   img.src = `assets/cards/${imgName}.jpg`;
   img.alt = `${LABELS[card.type]||card.type} ${card.number||''}`;
+  img.draggable = false;
   img.onerror = () => {
     img.remove();
     el.innerHTML = `<span class="card-icon">${PIECE_ICON[card.type]||'?'}</span><span class="card-name">${LABELS[card.type]||card.type}${card.number?' '+card.number:''}</span>`;
@@ -49,16 +62,31 @@ export function renderBoard(onSlotClick) {
   boardEl.innerHTML = '';
   if (!S.board) return;
 
+  boardEl.style.transform = '';
+
   const selCard = S.selCard;
   const inSelectSlot = S.phase === 'select-slot' && selCard;
 
-  for (let r = 0; r < 3; r++) {
-    for (let c = 0; c < 3; c++) {
+  // Tính thứ tự render ô theo góc nhìn của người chơi
+  // Chiều kim đồng hồ: 0=bottom, 1=left, 2=top, 3=right
+  // Mỗi người thấy bàn xoay sao cho "phía mình" luôn ở dưới
+  function getCell(viewR, viewC, myIdx) {
+    switch (myIdx % 4) {
+      case 0: return [viewR, viewC];         // bottom: bình thường
+      case 1: return [viewC, 2-viewR];       // left: CCW 90°
+      case 2: return [2-viewR, 2-viewC];     // top: 180°
+      case 3: return [2-viewC, viewR];       // right: CW 90°
+      default: return [viewR, viewC];
+    }
+  }
+
+  for (let viewR = 0; viewR < 3; viewR++) {
+    for (let viewC = 0; viewC < 3; viewC++) {
+      const [r, c] = getCell(viewR, viewC, S.myIndex);
       const pile = S.board[r][c];
       const top  = pile[pile.length - 1];
       const isAttack = S.attackSquares.some(([ar,ac]) => ar===r && ac===c);
-      // Ô có top card: kiểm tra canPlace. Ô trống: không thể đặt (không có top để so màu/loại)
-      const canPlaceHere = inSelectSlot && top != null && canPlace(selCard, top);
+      const canPlaceHere = inSelectSlot && (top ? canPlace(selCard, top) : true);
 
       const cell = document.createElement('div');
       cell.className = `board-cell${isAttack?' can-attack':''}${canPlaceHere?' can-place':''}`;
@@ -85,35 +113,55 @@ export function renderBoard(onSlotClick) {
 }
 
 // ── Render tay bài của mình ───────────────────────────────────
-export function renderMyHand(onCardClick) {
+export function renderMyHand(onCardClick, onReorder) {
   const handEl = document.getElementById('my-hand');
   handEl.innerHTML = '';
   const hand = S.hands[S.myIndex] || [];
 
-  // Tính sẵn những lá có thể đặt lên ít nhất 1 ô (khi đang select-card)
-  const playableIdxs = new Set();
-  if (S.phase === 'select-card' && S.board) {
-    hand.forEach((card, i) => {
-      if (!card || !card.type) return;
-      for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) {
-        const pile = S.board[r][c];
-        const top  = pile[pile.length - 1];
-        if (top && canPlace(card, top)) { playableIdxs.add(i); break; }
-      }
-    });
-  }
-
   hand.forEach((card, i) => {
     const isSelected = S.selCardIdx === i;
-    const canP = S.phase === 'select-card' && playableIdxs.has(i);
-    const el = makeCardEl(card, { selected: isSelected, canPlace: canP });
+    const el = makeCardEl(card, { selected: isSelected });
     el.addEventListener('click', () => onCardClick(i));
+
+    // ── Drag & Drop để sắp xếp lá bài ──
+    el.draggable = true;
+    el.dataset.idx = i;
+
+    el.addEventListener('dragstart', (e) => {
+      e.dataTransfer.setData('text/plain', String(i));
+      setTimeout(() => el.classList.add('dragging'), 0);
+    });
+    el.addEventListener('dragend', () => {
+      el.classList.remove('dragging');
+      document.querySelectorAll('#my-hand .card').forEach(c => c.classList.remove('drag-over'));
+    });
+    el.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      document.querySelectorAll('#my-hand .card').forEach(c => c.classList.remove('drag-over'));
+      el.classList.add('drag-over');
+    });
+    el.addEventListener('dragleave', () => {
+      el.classList.remove('drag-over');
+    });
+    el.addEventListener('drop', (e) => {
+      e.preventDefault();
+      el.classList.remove('drag-over');
+      const fromIdx = parseInt(e.dataTransfer.getData('text/plain'));
+      const toIdx = i;
+      if (fromIdx === toIdx || isNaN(fromIdx)) return;
+      if (onReorder) onReorder(fromIdx, toIdx);
+    });
+
     handEl.appendChild(el);
   });
 
   // Nút hạ bài
   const btnHa = document.getElementById('btn-ha-bai');
-  if (btnHa) btnHa.classList.toggle('hidden', !canHaBai(hand));
+  if (btnHa) {
+    const canHa = canHaBai(hand);
+    btnHa.classList.toggle('hidden', !canHa);
+    if (canHa) btnHa.title = 'Tất cả lá tạo được combo — ấn để hạ bài thắng!';
+  }
 }
 
 // ── Render tay bài đối thủ (úp) ──────────────────────────────
@@ -129,7 +177,7 @@ export function renderOpponentHand(position, playerIdx) {
 
 // ── Render toàn bộ zones ──────────────────────────────────────
 export function renderZones() {
-  const positions = ['bottom','top','left','right'];
+  const positions = ['bottom','left','top','right'];
   const numP = S.numPlayers;
 
   // Ẩn tất cả zones đối thủ trước
@@ -201,9 +249,9 @@ export function renderPhaseText() {
 }
 
 // ── Render tất cả ────────────────────────────────────────────
-export function renderAll(onCardClick, onSlotClick) {
+export function renderAll(onCardClick, onSlotClick, onReorder) {
   renderBoard(onSlotClick);
-  renderMyHand(onCardClick);
+  renderMyHand(onCardClick, onReorder);
   renderZones();
   renderTurnBanner();
   renderPhaseText();
